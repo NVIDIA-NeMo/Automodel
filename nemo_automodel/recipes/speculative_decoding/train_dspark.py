@@ -25,7 +25,6 @@ plumbing -- and trains the draft with the three-term DSpark objective.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -81,7 +80,7 @@ from nemo_automodel.components.speculative.dspark.registry import (
     resolve_dspark_draft_spec,
 )
 from nemo_automodel.components.speculative.dspark.remote import DSparkTargetInfo, RemoteDSparkTargetModel
-from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel
+from nemo_automodel.components.speculative.dspark.target import HFDSparkTargetModel, _DSparkPackedForward
 from nemo_automodel.components.speculative.dspark.target_utils import (
     DEEPSEEK_V4_MODEL_TYPE as _DEEPSEEK_V4_MODEL_TYPE,
 )
@@ -432,6 +431,8 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
     # A freshly-initialized DSpark draft (random attention layers, Markov head,
     # confidence head) spikes when it reaches near-peak LR within a few steps.
     min_warmup_steps = 20
+    # Weight of the confidence loss when recipe_args.confidence_head_alpha is not set.
+    default_confidence_head_alpha = 1.0
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -992,7 +993,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
             and attention_backend != "flex_attention"
         ):
             raise ValueError(f"DSpark training requires attention_backend='flex_attention', got {attention_backend!r}.")
-        confidence_head_alpha = float(recipe_cfg.get("confidence_head_alpha", 1.0))
+        confidence_head_alpha = float(recipe_cfg.get("confidence_head_alpha", self.default_confidence_head_alpha))
         markov_rank = int(recipe_cfg.get("markov_rank", 256))
 
         draft_model = None
@@ -1192,7 +1193,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
             logger.info("Trackio experiment tracking enabled")
 
     def _build_target_wrapper(
-        self, target_layer_ids: list[int], target_packed_forward: Callable[..., object] | None
+        self, target_layer_ids: list[int], target_packed_forward: _DSparkPackedForward | None
     ) -> HFDSparkTargetModel:
         """Wrap the loaded frozen target for online feature capture."""
         return HFDSparkTargetModel(

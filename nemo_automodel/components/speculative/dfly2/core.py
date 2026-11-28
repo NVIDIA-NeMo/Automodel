@@ -41,7 +41,7 @@ class DFly2TrainerModule(nn.Module):
         *,
         dpace_alpha: float = 0.5,
         lk_eta: float = 3.0,
-        confidence_head_alpha: float = 1.0,
+        confidence_head_alpha: float = 0.0,
     ):
         super().__init__()
         if not 0.0 <= dpace_alpha <= 1.0:

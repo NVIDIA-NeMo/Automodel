@@ -61,7 +61,8 @@ from nemo_automodel.components.speculative.dspark.common import (
 )
 from nemo_automodel.shared.utils import dtype_from_str
 
-# Slots per block covered by the gated block read's per-slot tables (the released layout).
+# Width of the per-slot bias tables of the attentive correction's prefix read, so the longest
+# supported block. Fixed by the shapes of the released draft's tensors.
 MAX_BLOCK_SLOTS = 16
 _SPARSE_BACKENDS = ("tilelang", "cudnn")
 
@@ -165,7 +166,7 @@ def _listed_latent_attention(
         query: Tensor of shape [batch, queries, heads, head_dim].
         kv: Tensor of shape [batch, keys, head_dim].
         indices: Integer tensor of shape [batch, queries, slots] of ``kv`` rows, ``-1``
-            unused. A row must not list a key twice.
+            unused. The listed keys of a row must be distinct.
         sinks: FP32 tensor of shape [heads], learned logits added to every softmax
             denominator only.
         scale: Query/key score multiplier.
@@ -377,37 +378,40 @@ class _DeepseekV41DFly2AttentiveCorrection(nn.Module):
         self.block_gate_bias = DeepseekV4FP32Parameter(torch.zeros(self.num_heads, MAX_BLOCK_SLOTS))
         self.rotary_emb = _RotaryEmbedding(config, compressed=True)
 
-    def _read_block(
+    def _prefix_read(
         self, query: torch.Tensor, keys: torch.Tensor, inputs: torch.Tensor, block_size: int
     ) -> torch.Tensor:
-        """Read each slot's block prefix through its own softmax and gate.
+        """Gated read of each slot's own block prefix (slots ``0..k`` for slot ``k``).
+
+        The prefix has a softmax of its own: a per-head learned bias indexed by how many slots
+        back the key is, plus the ``block_sink`` logit in the denominator as an extra column.
+        Each head scales its read by ``tanh`` of a gate computed from the slot's inputs.
 
         Args:
             query: Tensor of shape [batch, slots, heads, head_dim], whole blocks of ``block_size``.
-            keys: Tensor of shape [batch, slots, head_dim], each slot's key and value.
+            keys: Tensor of shape [batch, slots, head_dim], each slot's key, also its value.
             inputs: Tensor of shape [batch, slots, 2 * hidden], the query inputs.
             block_size: Slots per block.
 
         Returns:
             FP32 tensor of shape [batch, slots, heads, head_dim].
         """
-        batch, slots, heads, _ = query.shape
+        batch, slots, heads, head_dim = query.shape
         blocks = slots // block_size
-        q = query.float().view(batch, blocks, block_size, heads, -1)
-        k = keys.float().view(batch, blocks, block_size, -1)
-        logits = torch.einsum("bgqhd,bgkd->bghqk", q, k) * self.head_dim**-0.5
-        step = torch.arange(block_size, device=query.device)
-        back = step.view(-1, 1) - step.view(1, -1)
-        logits = logits + self.block_rel_bias(query).float()[:, back.clamp(min=0)]
-        logits = logits.masked_fill(back < 0, torch.finfo(logits.dtype).min)
-        total = torch.logaddexp(
-            torch.logsumexp(logits, dim=-1, keepdim=True), self.block_sink(query).float().view(1, 1, -1, 1, 1)
-        )
-        read = torch.einsum("bghqk,bgkd->bgqhd", torch.exp(logits - total), k).reshape(batch, slots, heads, -1)
-        slot = torch.arange(slots, device=query.device) % block_size
-        gate = torch.tanh(
-            self.block_gate(inputs).float() + self.block_gate_bias(query).float()[:, slot].transpose(0, 1)
-        )
+        per_block_query = query.float().unflatten(1, (blocks, block_size))
+        per_block_keys = keys.float().unflatten(1, (blocks, block_size))
+        scores = torch.einsum("bnshd,bntd->bnhst", per_block_query, per_block_keys) * head_dim**-0.5
+        # distance[s, t] = s - t: how far back key slot t lies from query slot s.
+        positions = torch.arange(block_size, device=query.device)
+        distance = (positions.unsqueeze(1) - positions.unsqueeze(0)).clamp(min=0)
+        scores = scores + self.block_rel_bias(query).float()[:, distance]
+        prefix = torch.ones(block_size, block_size, dtype=torch.bool, device=query.device).tril()
+        scores = scores.masked_fill(~prefix, float("-inf"))
+        sink = self.block_sink(query).float().view(1, 1, heads, 1, 1).expand(*scores.shape[:-1], 1)
+        weights = torch.cat((scores, sink), dim=-1).softmax(dim=-1)[..., :-1]
+        read = torch.einsum("bnhst,bntd->bnshd", weights, per_block_keys).flatten(1, 2)
+        slot_bias = self.block_gate_bias(query).float()[:, positions.repeat(blocks)]
+        gate = torch.tanh(self.block_gate(inputs).float() + slot_bias.T)
         return read * gate.unsqueeze(-1)
 
     def forward(
@@ -445,7 +449,7 @@ class _DeepseekV41DFly2AttentiveCorrection(nn.Module):
             self.head_dim**-0.5,
             backend=self.backend.attn,
         )
-        read = (context.float() + self._read_block(query, keys, inputs, block_size)).to(query.dtype)
+        read = (context.float() + self._prefix_read(query, keys, inputs, block_size)).to(query.dtype)
         read = _apply_rope(read, angles, inverse=True)
         return self.wo_b(self.wo_a(read.reshape(*read.shape[:2], self.num_groups, -1)).flatten(2))
 
@@ -497,6 +501,27 @@ class _DeepseekV41DFly2HiddenCorrection(nn.Module):
         return hidden_states + delta
 
 
+class _DeepseekV41DFly2ConfidenceHead(nn.Module):
+    """FP32 acceptance head on the drafted slots' backbone states (absent from the released draft)."""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        # Named so the strict FP32 entry also matches inside the head's own FSDP unit.
+        self.confidence_proj = nn.Linear(hidden_size, 1, dtype=torch.float32)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Predict an acceptance logit per slot.
+
+        Args:
+            hidden_states: Tensor of shape [..., hidden], with arbitrary leading dimensions.
+
+        Returns:
+            FP32 tensor of shape [...].
+        """
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            return self.confidence_proj(hidden_states.float()).squeeze(-1)
+
+
 class DeepseekV41DFly2Model(nn.Module):
     """Model-owned DFly2 draft emitting the shared DSpark loss inputs over its drafted slots."""
 
@@ -510,7 +535,7 @@ class DeepseekV41DFly2Model(nn.Module):
         "attention.block_sink",
         "attention.block_rel_bias",
         "attention.block_gate_bias",
-        "confidence_head",
+        "confidence_proj",
     ]
     # Same fp32 holders as DeepseekV41ForCausalLM: the draft's attention sinks share one FSDP
     # unit across the draft blocks (parallelizer_utils.fully_shard_across_blocks).
@@ -522,8 +547,8 @@ class DeepseekV41DFly2Model(nn.Module):
         text = config.text_config
         dtype = dtype_from_str(text.dtype, torch.bfloat16)
         self.dfly2_config = config
-        # The exported config.json: the target's text config with the DFly2 settings alongside,
-        # as the released draft stores it.
+        # The exported config.json: the target's text config with the DFly2 settings in a
+        # ``dfly_config`` block (block size, paired layers, mask token, correction layout).
         self.config = copy.deepcopy(text)
         self.config.architectures = ["DeepseekV41DFly2Model"]
         self.config.dfly_config = {
@@ -531,7 +556,15 @@ class DeepseekV41DFly2Model(nn.Module):
             "causal_block": False,
             "target_kv_layers": list(config.target_layer_ids),
             "target_index_layers": list(config.target_layer_ids),
+            "index_topk": text.index_topk,
             "mask_token_id": config.mask_token_id,
+            "rope": {
+                "theta": text.compress_rope_theta,
+                "original_seq_len": (text.rope_scaling or {}).get("original_max_position_embeddings", 0),
+                "factor": (text.rope_scaling or {}).get("factor", 1.0),
+                "beta_fast": (text.rope_scaling or {}).get("beta_fast", 32),
+                "beta_slow": (text.rope_scaling or {}).get("beta_slow", 1),
+            },
             "mtp_fusion": "slot0",
             "hidden_correction": {"intermediate_size": text.hidden_size},
             "attentive_correction": {
@@ -541,6 +574,7 @@ class DeepseekV41DFly2Model(nn.Module):
                 "block_kv_in": "hidden_embed",
                 "max_block_slots": MAX_BLOCK_SLOTS,
             },
+            "dense_dtype": str(dtype).removeprefix("torch."),
         }
         self.moe_config = MoEConfig(
             dim=text.hidden_size,
@@ -571,7 +605,7 @@ class DeepseekV41DFly2Model(nn.Module):
         self.mtp_fusion = _DeepseekV41DFly2MTPFusion(text, dtype)
         self.hidden_correction = _DeepseekV41DFly2HiddenCorrection(text, text.hidden_size, backend, dtype)
         self.confidence_head = (
-            nn.Linear(text.hidden_size, 1, dtype=torch.float32) if config.enable_confidence_head else None
+            _DeepseekV41DFly2ConfidenceHead(text.hidden_size) if config.enable_confidence_head else None
         )
         self.embed_tokens = nn.Embedding(text.vocab_size, text.hidden_size, padding_idx=text.pad_token_id, dtype=dtype)
         self.lm_head = nn.Linear(text.hidden_size, text.vocab_size, bias=False, dtype=dtype)
@@ -580,6 +614,9 @@ class DeepseekV41DFly2Model(nn.Module):
         )
 
         self.state_dict_adapter = DeepseekV41DFly2StateDictAdapter(text, self.moe_config, backend, dtype=dtype)
+        # The released keys of the whole draft, recorded before sharding: under FSDP each rank
+        # exports only its own experts, and the consolidated index must list all of them.
+        self._pre_shard_hf_state_dict_keys = self.state_dict_adapter.get_hf_state_dict_keys(self.state_dict())
         self.initialize_weights(self.embed_tokens.weight.device)
 
     @torch.no_grad()
@@ -619,35 +656,29 @@ class DeepseekV41DFly2Model(nn.Module):
         correction.down_proj.weight.zero_()
         self.initialize_attentive_correction()
         if self.confidence_head is not None:
-            nn.init.normal_(self.confidence_head.weight, std=std)
-            nn.init.zeros_(self.confidence_head.bias)
+            nn.init.normal_(self.confidence_head.confidence_proj.weight, std=std)
+            nn.init.zeros_(self.confidence_head.confidence_proj.bias)
 
     @torch.no_grad()
     def initialize_attentive_correction(self) -> None:
-        """Start the attentive correction as the last draft layer's attention, closed.
+        """Start the attentive correction from the last draft layer's attention, with its output closed.
 
-        The hidden half of ``q_in`` and ``kv_in`` copies the layer's ``wq_a`` and ``wkv``
-        (the previous-token half is zero), the norms, ``wq_b``, ``wo_a`` and the sinks are
-        copied, and ``wo_b``, the block gate and the distance biases are zero, so the
-        correction outputs zero until it trains.
+        Its query and key input projections read ``[hidden; previous embedding]``: the hidden
+        columns take the layer's ``wq_a`` / ``wkv`` and the embedding columns start at zero. The
+        norms, ``wq_b``, ``wo_a`` and both sinks take the layer's values; ``wo_b``, the gate and
+        the per-slot biases start at zero, so the correction contributes nothing until trained.
         """
         source = self.layers[-1].attn
-        attention = self.hidden_correction.attention
-        hidden = self.dfly2_config.text_config.hidden_size
-        attention.q_in.weight.zero_()
-        attention.q_in.weight[:, :hidden].copy_(source.wq_a.weight)
-        attention.q_norm.weight.copy_(source.q_norm.weight)
-        attention.wq_b.weight.copy_(source.wq_b.weight)
-        attention.kv_in.weight.zero_()
-        attention.kv_in.weight[:, :hidden].copy_(source.wkv.weight)
-        attention.kv_norm.weight.copy_(source.kv_norm.weight)
-        attention.wo_a.load_state_dict(source.wo_a.state_dict())
-        attention.wo_b.weight.zero_()
-        attention.attn_sink.weight.copy_(source.sinks_param.weight)
-        attention.block_sink.weight.copy_(source.sinks_param.weight)
-        attention.block_rel_bias.weight.zero_()
-        attention.block_gate_bias.weight.zero_()
-        attention.block_gate.weight.zero_()
+        correction = self.hidden_correction.attention
+        for name in ("q_norm", "wq_b", "kv_norm", "wo_a"):
+            getattr(correction, name).load_state_dict(getattr(source, name).state_dict())
+        for widened, projection in ((correction.q_in, source.wq_a), (correction.kv_in, source.wkv)):
+            hidden_columns = projection.weight
+            widened.weight.copy_(torch.cat((hidden_columns, torch.zeros_like(hidden_columns)), dim=1))
+        for sink in (correction.attn_sink, correction.block_sink):
+            sink.weight.copy_(source.sinks_param.weight)
+        for closed in (correction.wo_b, correction.block_gate, correction.block_rel_bias, correction.block_gate_bias):
+            closed.weight.zero_()
 
     @torch.no_grad()
     def initialize_from_target(self, target: nn.Module) -> None:
@@ -847,8 +878,7 @@ class DeepseekV41DFly2Model(nn.Module):
             states = backbone.view(batch, num_blocks, block_size, hidden)[:, :, 1:]
             if self.dfly2_config.confidence_head_stop_gradient:
                 states = states.detach()
-            with torch.autocast(device_type=states.device.type, enabled=False):
-                confidence_pred = self.confidence_head(states.float()).squeeze(-1)
+            confidence_pred = self.confidence_head(states)
         return DSparkForwardOutput(
             draft_logits=self.compute_logits(drafted),
             target_ids=slot_tokens[..., 1:],

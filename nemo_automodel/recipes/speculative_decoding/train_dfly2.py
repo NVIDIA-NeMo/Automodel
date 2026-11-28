@@ -29,21 +29,66 @@ paired target layers, one per draft layer.
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Callable
+from pathlib import Path
 
 import torch
 
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.speculative.dfly2 import DFly2TargetModel, DFly2TrainerModule, ModelOwnedDFly2Provider
 from nemo_automodel.components.speculative.dspark.core import DSparkStepMetrics
+from nemo_automodel.components.speculative.dspark.registry import ModelOwnedDSparkProvider
+from nemo_automodel.components.speculative.dspark.target import _DSparkPackedForward
 from nemo_automodel.recipes.speculative_decoding.train_dspark import TrainDSparkRecipe, _DraftArgs
 
 logger = logging.getLogger(__name__)
 
 
+def check_dfly2_checkpoint_settings(
+    path: str, *, target_layer_ids: list[int], block_size: int, mask_token_id: int
+) -> None:
+    """Refuse warm-start weights whose recorded DFly2 settings differ from this run's.
+
+    The paired target layers, the block size and the mask token own no tensors, so a draft
+    trained with others loads cleanly and then reads the wrong keys. A released draft and an
+    export of this recipe record them in ``config.json`` under ``dfly_config``.
+
+    Args:
+        path: The configured ``draft_weights_path``, a directory or a ``.safetensors`` file.
+        target_layer_ids: Paired target layers of this run, in draft-layer order.
+        block_size: Draft slots per block of this run.
+        mask_token_id: Mask token of this run.
+
+    Raises:
+        ValueError: A recorded setting differs from this run's.
+    """
+    root = Path(path)
+    config_path = (root if root.is_dir() else root.parent) / "config.json"
+    if not config_path.is_file():
+        return
+    recorded = json.loads(config_path.read_text()).get("dfly_config")
+    if not recorded:
+        return
+    expected = {
+        "target_kv_layers": [int(layer_id) for layer_id in target_layer_ids],
+        "block_size": int(block_size),
+        "mask_token_id": int(mask_token_id),
+    }
+    mismatched = {
+        name: {"checkpoint": recorded[name], "this run": value}
+        for name, value in expected.items()
+        if name in recorded and recorded[name] != value
+    }
+    if mismatched:
+        raise ValueError(f"draft_weights_path={path!r} was trained with other DFly2 settings: {mismatched}.")
+
+
 class TrainDFly2Recipe(TrainDSparkRecipe):
     """Recipe for DFly2 draft-model training on a colocated sparse-attention target."""
+
+    # The released draft has no confidence head, so a run that does not ask for one can warm-start from it.
+    default_confidence_head_alpha = 0.0
 
     def setup(self):
         """Reject the DSpark options DFly2 does not support, then build everything via the DSpark recipe."""
@@ -62,13 +107,13 @@ class TrainDFly2Recipe(TrainDSparkRecipe):
         super().setup()
 
     def _build_target_wrapper(
-        self, target_layer_ids: list[int], target_packed_forward: Callable[..., object] | None
+        self, target_layer_ids: list[int], target_packed_forward: _DSparkPackedForward | None
     ) -> DFly2TargetModel:
         """Capture the paired layers' keys and key lists instead of hidden states."""
         del target_packed_forward  # packing is rejected in setup
         return DFly2TargetModel(self.target_model, target_layer_ids)
 
-    def _build_model_owned_draft(self, target_config: object, margs: _DraftArgs) -> torch.nn.Module:
+    def _build_model_owned_draft(self, target_config: ModelOwnedDSparkProvider, margs: _DraftArgs) -> torch.nn.Module:
         """Build the target package's DFly2 draft and start its layers from their paired target layers."""
         if not isinstance(target_config, ModelOwnedDFly2Provider):
             raise ValueError(f"{type(target_config).__name__} does not provide a DFly2 draft")
@@ -83,6 +128,14 @@ class TrainDFly2Recipe(TrainDSparkRecipe):
             # Long rows need the sparse kernel ("tilelang" or "cudnn"); "sdpa" builds a dense mask.
             attn_backend=str(recipe_cfg.get("draft_attn_backend", "sdpa")),
         )
+        draft_weights_path = recipe_cfg.get("draft_weights_path", None)
+        if draft_weights_path:
+            check_dfly2_checkpoint_settings(
+                str(draft_weights_path),
+                target_layer_ids=list(margs.target_layer_ids),
+                block_size=int(margs.block_size),
+                mask_token_id=int(margs.mask_token_id),
+            )
         draft_model = target_config.build_dfly2_draft(options)
         # Collective over the sharded target: every rank builds the draft and gathers the same tensors.
         draft_model.initialize_from_target(self.target_model)

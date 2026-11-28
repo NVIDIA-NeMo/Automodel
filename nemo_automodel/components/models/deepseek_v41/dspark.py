@@ -622,6 +622,9 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
         )
 
         self.state_dict_adapter = DeepseekV41DSparkStateDictAdapter(config, self.moe_config, backend, dtype=dtype)
+        # The released keys of the whole draft, recorded before sharding: under FSDP each rank
+        # exports only its own experts, and the consolidated index must list all of them.
+        self._pre_shard_hf_state_dict_keys = self.state_dict_adapter.get_hf_state_dict_keys(self.state_dict())
         self.initialize_weights(self.embed_tokens.weight.device)
 
     @property

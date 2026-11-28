@@ -31,11 +31,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from nemo_automodel.components.models.deepseek_v41.attention import (
     DeepseekV41Attention,
     DeepseekV41AttentionOutput,
+    DeepseekV41AttentionState,
     _apply_rope,
 )
 from nemo_automodel.components.models.deepseek_v41.quantization import quantize_cache
@@ -93,7 +95,7 @@ def dfly2_target_features(
         def _hook(
             module: DeepseekV41Attention,
             args: tuple[torch.Tensor, ...],
-            kwargs: dict[str, object],
+            kwargs: dict[str, torch.Tensor | DeepseekV41AttentionState | dist.ProcessGroup | bool | None],
             output: DeepseekV41AttentionOutput,
         ) -> None:
             """Record the keys of a layer whose input has shape [batch, sequence, hidden]."""

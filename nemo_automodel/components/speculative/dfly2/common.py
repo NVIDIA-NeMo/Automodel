@@ -76,9 +76,9 @@ def build_block_key_indices(
     Each block reads the key list of the target row just before its anchor, the last token
     the target has verified when the block is drafted. Every query of a block shares that
     list and then sees its own block's draft keys, which follow the ``num_context_keys``
-    context rows in the draft attention's key tensor. A block never sees another block, and
-    a dropped block (``block_keep_mask`` false) or an anchor at the sequence start sees no
-    key, so its output is zero.
+    context rows in the draft attention's key tensor. A block never sees another block. An
+    anchor at the sequence start has no verified row before it and sees only its own block;
+    a dropped block (``block_keep_mask`` false) sees no key at all, so its output is zero.
 
     Args:
         context_indices: Integer tensor of shape [batch, sequence, slots] with ``-1``
@@ -103,13 +103,14 @@ def build_block_key_indices(
     has_context = block_keep_mask & (anchor_positions > 0)
     context = torch.where(has_context.unsqueeze(-1), context, -1).repeat_interleave(block_size, dim=1)
 
-    query = torch.arange(num_anchors * block_size, device=device)
-    slot = torch.arange(block_size, device=device)
-    draft = num_context_keys + (query // block_size).unsqueeze(-1) * block_size + slot
-    visible = block_keep_mask.repeat_interleave(block_size, dim=1).unsqueeze(-1)
+    # Block j's draft keys are rows num_context_keys + j * block_size + (0 .. block_size - 1);
+    # each of its block_size queries lists all of them, or its prefix when causal.
+    block_rows = num_context_keys + torch.arange(num_anchors * block_size, device=device).view(num_anchors, block_size)
+    own_block = block_rows.unsqueeze(1).expand(-1, block_size, -1)
+    allowed = block_keep_mask.view(batch, num_anchors, 1, 1).expand(-1, -1, block_size, block_size)
     if causal:
-        visible = visible & (slot <= (query % block_size).unsqueeze(-1))
-    draft = torch.where(visible, draft.expand(batch, -1, -1), -1)
+        allowed = allowed & torch.ones(block_size, block_size, dtype=torch.bool, device=device).tril()
+    draft = torch.where(allowed, own_block, -1).flatten(1, 2)
 
     indices = torch.cat((context.to(torch.int32), draft.to(torch.int32)), dim=-1)
     return F.pad(indices, (0, -indices.shape[-1] % KEY_LIST_ALIGNMENT), value=-1)
