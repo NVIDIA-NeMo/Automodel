@@ -41,7 +41,7 @@ jobs:
 
   guardwords-check:
     needs: pr-info
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_guardwords_check.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_guardwords_check.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
     with:
       base-sha: ${{ needs.pr-info.outputs.base-sha }}
       head-sha: ${{ github.sha }}

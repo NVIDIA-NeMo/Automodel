@@ -32,9 +32,9 @@ permissions:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
     with:
-      workflow_ref: 1ebb754bdbe6680cce2b3d81da4e63be7200380a  # pragma: allowlist secret
+      workflow_ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
 
   setup-install-image:
     runs-on: ubuntu-latest
@@ -96,7 +96,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: 1ebb754bdbe6680cce2b3d81da4e63be7200380a  # pragma: allowlist secret
+          ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
           path: FW-CI-templates
 
       - name: Check imports for nemo_automodel
@@ -237,7 +237,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: 1ebb754bdbe6680cce2b3d81da4e63be7200380a  # pragma: allowlist secret
+          ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
           path: FW-CI-templates
 
       - name: Check imports for nemo_automodel
@@ -514,7 +514,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: 1ebb754bdbe6680cce2b3d81da4e63be7200380a  # pragma: allowlist secret
+          ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
           path: FW-CI-templates
 
       - name: Check imports for nemo_automodel
@@ -565,7 +565,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
-          ref: 1ebb754bdbe6680cce2b3d81da4e63be7200380a  # pragma: allowlist secret
+          ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
           path: FW-CI-templates
 
       - name: Check imports for nemo_automodel

@@ -31,16 +31,16 @@ permissions:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
     with:
-      workflow_ref: 1ebb754bdbe6680cce2b3d81da4e63be7200380a  # pragma: allowlist secret
+      workflow_ref: f47f58bcf571d7dee8678e0fc5f6eec7800dadd4  # pragma: allowlist secret
 
   copyright-check:
     needs: [pre-flight]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_copyright_check.yml@1ebb754bdbe6680cce2b3d81da4e63be7200380a
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_copyright_check.yml@f47f58bcf571d7dee8678e0fc5f6eec7800dadd4
 
   copyright-check-summary:
     needs: [pre-flight, copyright-check]
