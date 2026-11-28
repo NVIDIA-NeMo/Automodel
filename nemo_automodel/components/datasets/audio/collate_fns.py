@@ -21,12 +21,27 @@ so they feed the processor's ``audio=`` kwarg directly without going through
 marker-based :func:`nemo_automodel.components.datasets.vlm.collate_fns.build_labels_from_template`.
 """
 
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Literal, NotRequired, Sequence, TypedDict
 
 import numpy as np
 import torch
+from numpy.typing import NDArray
 
 from nemo_automodel.components.datasets.vlm.collate_fns import build_labels_from_template
+
+
+class _AudioProcessorKwargs(TypedDict):
+    """ASR-only processor request, after waveform validation.
+
+    Each audio entry is a mono CPU waveform of shape [samples], in float32.
+    Entries follow conversation order and may outnumber the text prompts.
+    """
+
+    text: list[str]
+    return_tensors: Literal["pt"]
+    padding: Literal[True]
+    padding_side: Literal["right"]
+    audio: NotRequired[list[NDArray[np.float32]]]
 
 
 def _extract_audios_from_conversation(conversation: Sequence[Dict[str, Any]]) -> List[Any]:
@@ -48,7 +63,7 @@ def _extract_audios_from_conversation(conversation: Sequence[Dict[str, Any]]) ->
     return audios
 
 
-def _validate_and_coerce_audio_payload(payload: Any, sample_index: int) -> np.ndarray:
+def _validate_and_coerce_audio_payload(payload: Any, sample_index: int) -> NDArray[np.float32]:
     """Coerce an audio payload to a 1-D ``float32`` ``np.ndarray`` or raise.
 
     The single rule:
@@ -63,7 +78,9 @@ def _validate_and_coerce_audio_payload(payload: Any, sample_index: int) -> np.nd
             messages).
 
     Returns:
-        A 1-D ``np.float32`` ``np.ndarray``.
+        A CPU ``np.float32`` array of shape [samples]. Already-float32 NumPy
+        inputs are returned by reference; CPU float32 tensors share storage
+        with their detached NumPy view. Other dtypes require a conversion.
 
     Raises:
         ValueError: When the payload is not a numeric array or is not 1-D.
@@ -161,13 +178,13 @@ def qwen3_omni_asr_collate_fn(
 
     texts = [processor.apply_chat_template(conv, add_generation_prompt=False, tokenize=False) for conv in conversations]
 
-    all_audios: List[Any] = []
+    all_audios: list[NDArray[np.float32]] = []
     for idx, conv in enumerate(conversations):
         sample_audios = _extract_audios_from_conversation(conv)
         for payload in sample_audios:
             all_audios.append(_validate_and_coerce_audio_payload(payload, sample_index=idx))
 
-    processor_kwargs = {
+    processor_kwargs: _AudioProcessorKwargs = {
         "text": texts,
         "return_tensors": "pt",
         "padding": True,

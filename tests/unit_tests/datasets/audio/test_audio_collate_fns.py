@@ -279,3 +279,31 @@ def test_qwen3_omni_asr_collate_rejects_2d_audio(audio_collate_mod):
     ]
     with pytest.raises(ValueError, match=r"sample\[0\].*1-D"):
         audio_collate_mod.qwen3_omni_asr_collate_fn([{"conversation": conv}], processor)
+
+
+@pytest.mark.parametrize("source_kind", ["numpy", "tensor", "float64"])
+def test_validated_waveform_is_accepted_by_whisper_features(audio_collate_mod, source_kind):
+    from transformers import WhisperFeatureExtractor
+
+    waveform = _np.linspace(-0.5, 0.5, 800, dtype=_np.float32)
+    if source_kind == "tensor":
+        source = torch.from_numpy(waveform).requires_grad_()
+    elif source_kind == "float64":
+        source = waveform.astype(_np.float64)
+    else:
+        source = waveform
+    actual = audio_collate_mod._validate_and_coerce_audio_payload(source, sample_index=0)
+    assert actual.shape == (800,)
+    assert actual.dtype == _np.float32
+    _np.testing.assert_array_equal(actual, waveform)
+    if source_kind == "numpy":
+        assert actual is source
+    elif source_kind == "tensor":
+        assert _np.shares_memory(actual, waveform)
+    else:
+        assert not _np.shares_memory(actual, source)
+    extractor = WhisperFeatureExtractor(feature_size=8, sampling_rate=16000, chunk_length=1)
+    actual_features = extractor([actual], sampling_rate=16000, return_tensors="pt")["input_features"]
+    expected_features = extractor([waveform], sampling_rate=16000, return_tensors="pt")["input_features"]
+    torch.testing.assert_close(actual_features, expected_features)
+    assert actual_features.dtype == torch.float32
