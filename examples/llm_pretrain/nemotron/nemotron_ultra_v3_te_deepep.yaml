@@ -7,7 +7,7 @@
 recipe: TrainFinetuneRecipeForNextTokenPrediction
 step_scheduler:
   gc_every_steps: 10
-  global_batch_size: 128
+  global_batch_size: 256  # the performance summary's GBS; LBS 1 (GA 2), LBS 2 does not fit with HybridEP
   local_batch_size: 1
   ckpt_every_steps: 1000
   val_every_steps: null
