@@ -45,6 +45,9 @@ The logs report the corpus cross entropy (`ce`), the TV term (`tv`), the
 per-position acceptance `accept_rate@k`, and the expected accepted block length
 `tau`.
 
+As in the DSpark recipe, a block is supervised up to its first unsupervised label,
+and the D-PACE weights ignore slots past the end of the sequence.
+
 ## Data
 
 Use a chat dataset of OpenAI-format `messages` rows with the responses
@@ -76,8 +79,17 @@ The key settings in `recipe_args` are:
 | `draft_attn_backend` | `tilelang` | the sparse kernel reads each key list directly; `sdpa` builds a dense mask and suits only short rows |
 | `draft_weights_path` | unset | warm-start every draft weight from a released draft or an earlier run |
 
-Without `draft_weights_path`, each draft layer's attention, norms, and mHC mixes
-start from its paired target layer and the routed experts start fresh.
+Without `draft_weights_path`, each draft layer's attention, norms, mHC mixes, and
+shared expert start from its paired target layer. The routed experts and the router
+start fresh, where the paper draws 128 of the paired layer's experts with their router
+rows (its "attention only" ablation reaches 3.51 instead of 3.57 accepted tokens). A
+warm start checks the paired layers, block size, and mask token recorded in the
+checkpoint's `config.json` against the run's.
+
+The example trains with AdamW and FP32 master weights at a global batch of 256
+sequences; the paper uses Muon. Its learning rate is for a fresh draft: when
+warm-starting from the released draft, lower it (for example to `5.0e-6`), or the
+first steps move the converged draft away from its optimum.
 
 <Note>
 The DFly2 path trains against a colocated text target on unpacked rows. Sequence
