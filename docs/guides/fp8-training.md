@@ -146,4 +146,4 @@ FP8 works best when the majority of GEMM operations are sufficiently large such 
 
 - [TorchAO FP8 Documentation](https://github.com/pytorch/ao/tree/main/torchao/float8)
 - [FP8 Performance Benchmarks](https://github.com/pytorch/ao/tree/main/torchao/float8#performance)
-- [NVIDIA FP8 Primer](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html) 
+- [NVIDIA FP8 Primer](https://docs.nvidia.com/deeplearning/transformer-engine/examples/fp8_primer.html)
