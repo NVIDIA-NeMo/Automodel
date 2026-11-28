@@ -64,8 +64,11 @@ def check_dfly2_checkpoint_settings(
         ValueError: A recorded setting differs from this run's.
     """
     root = Path(path)
-    config_path = (root if root.is_dir() else root.parent) / "config.json"
-    if not config_path.is_file():
+    directory = root if root.is_dir() else root.parent
+    # A consolidated export holds config.json; a step checkpoint's model/ keeps it in .hf_metadata/.
+    candidates = (directory / "config.json", directory / ".hf_metadata" / "config.json")
+    config_path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if config_path is None:
         return
     recorded = json.loads(config_path.read_text()).get("dfly_config")
     if not recorded:
@@ -82,6 +85,37 @@ def check_dfly2_checkpoint_settings(
     }
     if mismatched:
         raise ValueError(f"draft_weights_path={path!r} was trained with other DFly2 settings: {mismatched}.")
+
+
+def check_fsdp_expert_split(num_experts: int, world_size: int) -> None:
+    """Refuse an FSDP2 world size under which the draft's routed experts cannot be checkpointed.
+
+    FSDP2 shards the grouped expert tensors along the expert dimension like ``torch.chunk``
+    (``ceil(experts / ranks)`` per rank, the last ranks short), while the checkpoint export
+    expects the balanced split (the remainder spread over the first ranks). Where the two
+    differ, the first save raises on some ranks and the others wait in a collective.
+
+    Args:
+        num_experts: Routed experts per draft layer.
+        world_size: Ranks the draft is sharded over.
+
+    Raises:
+        ValueError: The two splits differ for ``world_size``.
+    """
+
+    def splits_agree(ranks: int) -> bool:
+        chunked = [len(part) for part in torch.arange(num_experts).chunk(ranks)]
+        chunked += [0] * (ranks - len(chunked))
+        balanced = [num_experts // ranks + (rank < num_experts % ranks) for rank in range(ranks)]
+        return chunked == balanced
+
+    if world_size > 1 and not splits_agree(world_size):
+        usable = [ranks for ranks in range(2, 2 * num_experts + 1) if splits_agree(ranks)]
+        raise ValueError(
+            f"An FSDP2 world size of {world_size} cannot checkpoint the draft's {num_experts} routed experts per "
+            f"layer: FSDP2 splits them like torch.chunk and the checkpoint export expects an even split. "
+            f"Use one of {usable}."
+        )
 
 
 class TrainDFly2Recipe(TrainDSparkRecipe):
@@ -137,6 +171,11 @@ class TrainDFly2Recipe(TrainDSparkRecipe):
                 mask_token_id=int(margs.mask_token_id),
             )
         draft_model = target_config.build_dfly2_draft(options)
+        dist_cfg = self.cfg.get("distributed", None)
+        strategy = str(dist_cfg.get("strategy", "fsdp2")).lower() if dist_cfg is not None else "fsdp2"
+        if strategy == "fsdp2":
+            # Fail here rather than hang at the first checkpoint.
+            check_fsdp_expert_split(draft_model.moe_config.n_routed_experts, self.dist_env.world_size)
         # Collective over the sharded target: every rank builds the draft and gathers the same tensors.
         draft_model.initialize_from_target(self.target_model)
         return draft_model

@@ -993,7 +993,7 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
             and attention_backend != "flex_attention"
         ):
             raise ValueError(f"DSpark training requires attention_backend='flex_attention', got {attention_backend!r}.")
-        confidence_head_alpha = float(recipe_cfg.get("confidence_head_alpha", self.default_confidence_head_alpha))
+        confidence_head_alpha = self._resolve_confidence_head_alpha(recipe_cfg)
         markov_rank = int(recipe_cfg.get("markov_rank", 256))
 
         draft_model = None
@@ -1191,6 +1191,10 @@ class TrainDSparkRecipe(SpecDecodeRecipeBase):
             trackio_cfg.name = trackio_cfg.name or "dspark_" + str(target_path).rstrip("/").split("/")[-1]
             self.trackio_logger = trackio_cfg.build(run_config=self.cfg.to_yaml_dict(use_orig_values=True))
             logger.info("Trackio experiment tracking enabled")
+
+    def _resolve_confidence_head_alpha(self, recipe_cfg) -> float:
+        """Return ``recipe_args.confidence_head_alpha``, or this recipe's default when it is not set."""
+        return float(recipe_cfg.get("confidence_head_alpha", self.default_confidence_head_alpha))
 
     def _build_target_wrapper(
         self, target_layer_ids: list[int], target_packed_forward: _DSparkPackedForward | None

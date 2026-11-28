@@ -12,6 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Code provenance: the attentive correction's gated prefix read (``_prefix_read``) and its start from
+# the last draft layer (``DeepseekV41DFly2Model.initialize_attentive_correction``) are adapted from
+# Tencent/AngelSpec, https://github.com/Tencent/AngelSpec at revision e02ea36e65d44e6e165c4ba73c139d500e12f2d9,
+# file angelspec/models/draft/dsv41_attentive_correction.py, Copyright (C) 2026 Tencent, licensed
+# under the Apache License, Version 2.0. Modified by NVIDIA: rewritten for this module's layout.
+
 """DFly2 draft for DeepSeek-V4.1-Flash (arXiv:2611.34776).
 
 Each draft layer is a V4.1 block (latent MQA with an attention sink, routed MoE and
@@ -502,7 +508,7 @@ class _DeepseekV41DFly2HiddenCorrection(nn.Module):
 
 
 class _DeepseekV41DFly2ConfidenceHead(nn.Module):
-    """FP32 acceptance head on the drafted slots' backbone states (absent from the released draft)."""
+    """FP32 acceptance head on the drafted slots' final-normalized states (absent from the released draft)."""
 
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
@@ -670,8 +676,10 @@ class DeepseekV41DFly2Model(nn.Module):
         """
         source = self.layers[-1].attn
         correction = self.hidden_correction.attention
-        for name in ("q_norm", "wq_b", "kv_norm", "wo_a"):
-            getattr(correction, name).load_state_dict(getattr(source, name).state_dict())
+        correction.q_norm.load_state_dict(source.q_norm.state_dict())
+        correction.wq_b.load_state_dict(source.wq_b.state_dict())
+        correction.kv_norm.load_state_dict(source.kv_norm.state_dict())
+        correction.wo_a.load_state_dict(source.wo_a.state_dict())
         for widened, projection in ((correction.q_in, source.wq_a), (correction.kv_in, source.wkv)):
             hidden_columns = projection.weight
             widened.weight.copy_(torch.cat((hidden_columns, torch.zeros_like(hidden_columns)), dim=1))
@@ -682,7 +690,7 @@ class DeepseekV41DFly2Model(nn.Module):
 
     @torch.no_grad()
     def initialize_from_target(self, target: nn.Module) -> None:
-        """Start every draft layer's attention, norms and mHC mixes from its paired target layer.
+        """Start every draft layer's attention, norms, mHC mixes and shared expert from its paired target layer.
 
         Collective when the target is sharded: every rank must call it, in the same order.
         The routed experts and the router keep their fresh initialization; warm-start them
@@ -844,12 +852,12 @@ class DeepseekV41DFly2Model(nn.Module):
             )
             for keys, indices in zip(context_keys, context_indices)
         ]
-        backbone = self._backbone(noise_embeddings, context_keys, key_indices, position_ids)
+        normalized = self.final_norm(self._backbone(noise_embeddings, context_keys, key_indices, position_ids))
 
         # Teacher forcing: each slot's previous token is the anchor for slots 0 and 1, then the label before it.
         previous_tokens = torch.cat((slot_tokens[..., :1], slot_tokens[..., :-1]), dim=-1).flatten(1)
         corrected = self.hidden_correction(
-            self.final_norm(backbone),
+            normalized,
             self.embed_tokens(previous_tokens),
             context_keys[-1],
             context_key_indices(key_indices[-1], context_keys[-1].shape[1]),
@@ -875,7 +883,10 @@ class DeepseekV41DFly2Model(nn.Module):
         )
         confidence_pred = None
         if self.confidence_head is not None:
-            states = backbone.view(batch, num_blocks, block_size, hidden)[:, :, 1:]
+            # The final-normalized states, as the V4.1 DSpark draft feeds its head: the raw residual
+            # stream of a trained draft is tens of units in RMS, which gives the head a loss and a
+            # gradient that dominate the clipped norm of the whole draft.
+            states = normalized.view(batch, num_blocks, block_size, hidden)[:, :, 1:]
             if self.dfly2_config.confidence_head_stop_gradient:
                 states = states.detach()
             confidence_pred = self.confidence_head(states)
