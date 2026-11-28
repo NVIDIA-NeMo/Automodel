@@ -171,6 +171,26 @@ def test_loss_is_finite_scalar_and_backprops():
     assert attn_grad is not None and torch.isfinite(attn_grad).all()
 
 
+def test_bf16_draft_projects_the_fp32_target_last_hidden_state():
+    """Online capture hands the BF16 draft the FP32 last hidden state of a DeepSeek V4 target."""
+    model = _build_model().to(torch.bfloat16)
+    batch = _batch()
+    batch["target_hidden_states"] = batch["target_hidden_states"].to(torch.bfloat16)
+    assert batch["target_last_hidden_states"].dtype == torch.float32
+
+    with torch.no_grad():
+        out = _forward(model, batch)
+        logits = model.compute_logits(batch["target_last_hidden_states"])
+
+    assert out.aligned_target_logits.dtype == torch.bfloat16
+    assert out.aligned_target_logits.shape == (BATCH, NUM_ANCHORS, BLOCK_SIZE, VOCAB)
+    # The head sees the state rounded to BF16; FP32 arithmetic on those rounded operands is the reference.
+    rounded_state = batch["target_last_hidden_states"].to(torch.bfloat16).float()
+    reference = rounded_state @ model.lm_head.weight.float().T
+    assert logits.dtype == torch.bfloat16
+    torch.testing.assert_close(logits.float(), reference, rtol=2e-2, atol=2e-2)
+
+
 def test_config_builder_fields():
     cfg = build_deepseek_v4_draft_config(_tiny_target_config(), _tiny_model_args())
     assert cfg.architectures == ["DeepseekV4DSparkModel"]

@@ -322,7 +322,11 @@ class DeepseekV4DSparkModel(nn.Module):
         self.lm_head.requires_grad_(trainable)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(hidden_states)
+        """Project hidden states of shape [..., hidden] through the vocabulary head."""
+        # A DeepSeek V4 target returns its last hidden state in FP32: its hyper-connection
+        # head is kept in FP32 and the final norm keeps that dtype. The draft's own states
+        # already have the head's dtype.
+        return self.lm_head(hidden_states.to(self.lm_head.weight.dtype))
 
     def predict_confidence_step(
         self,
