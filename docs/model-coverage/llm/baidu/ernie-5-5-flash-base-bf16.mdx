@@ -123,10 +123,16 @@ with the highest index scores, so it discards keys only from position 2,176 of
 a document on. Training of the released model on single documents was
 validated with documents of at most 256 tokens, where every key is selected;
 the [packed recipes](#packed-sequences-and-context-parallelism) train on
-documents of up to 131,071 tokens. The key selection was
+documents of up to 131,071 tokens. With full fine-tuning on single documents,
+the released model was also trained for 100 updates with
+`dataset.seq_length: 384`. Full fine-tuning runs of 10 updates per length
+trained it with single documents of up to 768 tokens with `ep_size: 8` and of
+up to 1,024 tokens with `ep_size: 16` (refer to
+[Longer Documents](#longer-documents)). Every key is selected at all of these
+lengths up to 1,024 tokens. The key selection was
 exercised in a forward pass over documents of 4,096 tokens (refer to
-[Numerical Validation](#numerical-validation)) and in one training run of a
-three-layer model (refer to [Validated Configuration](#validated-configuration)).
+[Numerical Validation](#numerical-validation)) and in training runs of a
+three-layer model (refer to [Longer Documents](#longer-documents)).
 
 Multi-GPU training of the released model has been validated with the cuDNN
 path only. `model.backend.linear` must be `torch`. `experts` and `dispatcher`
@@ -204,7 +210,8 @@ from the sixth on was
 the timer of the validation script, and 13.5 s with the `torch` backends in
 the placement of the 10-update run. An earlier run of 100 updates with the
 `torch` backends on 16 nodes of one rack took a median of 6.2 s per update and
-used 175.8 GiB on the fullest GPU. HybridEP was not run in that placement.
+used 175.8 GiB on the fullest GPU. The recipe was not run with HybridEP in
+that placement.
 The 100-update run completed without non-finite losses or gradient norms. It
 validates the training mechanics, not model convergence. In the same job, 20
 updates with the `torch` expert and dispatcher backends took a median of 10.0 s
@@ -230,8 +237,8 @@ With the 64 GPUs in eight NVLink domains the difference was at most 0.33 GiB
 on a GPU. In an earlier run of the 43-layer model with the `torch` backends
 on 16 nodes of one rack, without the switch, the GPU of rank 0 held 36,133 MiB
 while the weights were being loaded and when the load ended, against 12,209 to
-12,215 MiB on the other 63 GPUs, as sampled with `nvidia-smi`. A run with all
-64 ranks in one rack and the switch on was not made. In every comparison of
+12,215 MiB on the other 63 GPUs, as sampled with `nvidia-smi`. A run of the recipe
+with all 64 ranks in one rack and the switch on was not made. In every comparison of
 the table, every rank held the same bytes in all loaded tensors with and
 without the switch. The switch covers loads only. A save plans over NCCL. The
 save and restore of the 43-layer model in the table below ran without the
@@ -252,14 +259,86 @@ checkpoint holds:
 | 3 layers (released layers 0, 1, and 7) | 16 on four nodes, `ep_size: 8`, HybridEP | Every expert group of 8 ranks on two nodes of one NVLink domain. One checkpoint after 16 updates: 29 GiB of weights and 142 GiB of optimizer state. Two new processes restored it, one with HybridEP and one with the `torch` backends, and trained 8 more updates. In both, every rank held the same bytes in all 106 tensors as the saving process after its last update, and the same optimizer state, including the update counter. |
 | 3 layers (released layers 0, 1, and 7) | 4 on one node, `ep_size: 2`, HybridEP and `torch` | Two checkpoints after 16 updates each, one saved with HybridEP and one with the `torch` backends. Each was restored by two new processes, one with HybridEP and one with the `torch` backends, which trained 8 more updates. In all four restores, every rank held the same bytes in all 106 tensors as the saving process after its last update, and the same optimizer state, including the update counter. |
 
-Training with documents long enough for the DSA layer to discard keys was run
-once, with the three-layer model on 4 GPUs (`ep_size: 2`) and the `torch`
-expert and dispatcher backends: 16 updates on
+### Longer Documents
+
+The recipe was run for 100 updates with `dataset.seq_length: 384`, on 16 nodes
+in eight NVLink domains of two nodes each, as in the validated configuration.
+The length and the output directory
+were the only configuration values that differed from the 100-update run of
+the validated configuration. The table compares the two runs. The validation
+rows are cut at 256 tokens in both runs.
+
+| Measurement | `seq_length: 256` | `seq_length: 384` |
+|---|---|---|
+| Validation loss after 50 updates, on 367 label tokens | 0.1086 | 0.1039 |
+| Validation loss after 100 updates, on 367 label tokens | 0.0980 | 0.0963 |
+| Step time, median over the 95 updates from the sixth on, by the timer of the validation script | 5.9 s | 5.9 s |
+| Device memory on the fullest GPU, as sampled with `nvidia-smi` | 153.2 GiB | 157.6 GiB |
+| Training rows without a label token, of the 6,400 rows of the 100 updates | 676 (10.56%) | 68 (1.06%) |
+
+The slowest update from the sixth on took 17 s at 384 tokens, against 14 s at
+256 tokens. The table compares one run at each length, so the lower validation
+loss at 384 tokens is not established as a gain.
+
+Documents of an exact length were trained with the 43-layer model and the
+released weights on 64 GPUs with HybridEP. Each row of the table below is one
+run that was set to 10 updates, without a checkpoint and without validation.
+With `ep_size: 8`, the nodes were placed the same way. With
+`ep_size: 16`, an expert group (`ep_size` consecutive ranks) is 16 ranks on
+four nodes. The four nodes of every group were in one NVLink domain (three
+groups in one rack and one group in another). Every document had exactly the
+given number of tokens. Consecutive SQuAD examples were concatenated and cut
+to that length by a dataset function that is not part of this repository.
+Peak allocated is `torch.cuda.max_memory_allocated` over the 10 updates, from
+the lowest to the highest of the 64 ranks. Device memory is the highest value
+sampled with `nvidia-smi` on any of the 64 GPUs. PyTorch reports a capacity of
+184.31 GiB per GPU.
+
+| Documents | `ep_size` | Result | Peak Allocated per Rank | Device Memory on the Fullest GPU |
+|---|---|---|---|---|
+| Exactly 384 tokens | 8 | Trained | 142.34 to 143.65 GiB | 162.22 GiB |
+| Exactly 512 tokens | 8 | Trained | 151.74 to 153.36 GiB | 171.94 GiB |
+| Exactly 768 tokens | 8 | Trained with the GPUs full. From the third update on, an update took a median of 8.31 s, against 5.89 s at 512 tokens. | 169.91 to 172.33 GiB | 184.30 GiB |
+| Exactly 1,024 tokens | 8 | Out of memory in the first update | 165.35 to 165.61 GiB in the first update, at the failure, on the three ranks that reported it | 184.30 GiB |
+| Exactly 512 tokens | 16 | Trained | 120.18 to 122.94 GiB | 141.62 GiB |
+| Exactly 768 tokens | 16 | Trained | 138.10 to 142.89 GiB | 161.78 GiB |
+| Exactly 1,024 tokens | 16 | Trained with the GPUs nearly full | 157.76 to 164.60 GiB | 183.96 GiB |
+| Exactly 1,280 tokens | 16 | Out of memory in the second update | 154.05 to 162.12 GiB in the first update. 178.50 to 179.16 GiB at the failure, on the four ranks that reported it. | 184.30 GiB |
+
+In the rows that trained, every loss and gradient norm was finite. The rows
+at 768 tokens with `ep_size: 8` and at 1,024 tokens with `ep_size: 16` left
+less than 0.4 GiB free on the fullest GPU. They show where the limit is with
+`distributed.activation_checkpointing: false` and
+`distributed.moe.reshard_after_forward: false`, the values of the recipe, and
+are not settings to train with. The
+[packed recipes](#packed-sequences-and-context-parallelism) set both to
+`true`. The following limits apply to the full fine-tuning runs of the
+43-layer model on single documents:
+
+- No run with documents of an exact length had more than 10 updates.
+- No checkpoint was written with a `seq_length` above 256 or with
+  `ep_size: 16`.
+- The rows of the recipe were not run with `ep_size: 16`.
+- No validation was run after training with `ep_size: 16`.
+- The rows of the recipe were not run with a `seq_length` above 384.
+- With documents longer than 256 tokens, full-parameter training with the
+  `torch` expert and dispatcher backends was not repeated after an earlier run
+  of 40 updates at 384 tokens.
+
+Training with single documents long enough for the DSA layer to discard keys
+was run with the three-layer model only. An earlier run used 4 GPUs
+(`ep_size: 2`) and the `torch` expert and dispatcher backends: 16 updates on
 documents of 4,096 tokens, with labels only on answer tokens from position
 2,176 on. The top-k step selected 2,048 of up to 3,968 remote keys, and the
 loss and the gradient norms stayed finite. The run was not compared with a
-reference. Outside the packed recipes, full fine-tuning of the 43-layer model
-has not been run with documents longer than 256 tokens.
+reference. Three runs of 10 updates used HybridEP. Two had documents of
+exactly 4,096 tokens, on 4 GPUs (`ep_size: 2`) and on 8 GPUs on two nodes
+(`ep_size: 8`). One had documents of exactly 8,192 tokens on 4 GPUs
+(`ep_size: 2`). The top-k step selected 2,048 of up to 3,968 remote keys at
+4,096 tokens and 2,048 of up to 8,064 at 8,192 tokens. The loss and the
+gradient norms stayed finite. These runs were not compared with a reference
+either. With full fine-tuning, no training run of the 43-layer model with
+single documents longer than 1,024 tokens completed.
 
 ## LoRA
 
@@ -829,7 +908,13 @@ following limits apply:
   the DSA layers, which requires `nvidia-cudnn-frontend[cutedsl]` and FlashMLA
   and is validated on SM100-class GPUs (GB200) only. Multi-GPU training of the
   released model has been validated with that path only, and, outside the
-  packed recipes, with documents of at most 256 tokens. With LoRA on single
+  packed recipes, with documents of at most 256 tokens. With
+  `dataset.seq_length: 384`, the full fine-tuning recipe ran 100 updates
+  without a checkpoint. Full fine-tuning runs of 10 updates with single
+  documents of an exact length left at least 12 GiB free on the fullest GPU
+  up to 512 tokens with `ep_size: 8` and up to 768 tokens with `ep_size: 16`.
+  Refer to [Longer Documents](#longer-documents) for the lengths at and
+  beyond the limit. With LoRA on single
   documents, an earlier state of the code ran three updates each at 384,
   512, 768, and 1,024 tokens with the `torch` expert and dispatcher backends
   to measure memory (113 to 161 GiB allocated at the peak); this is not a

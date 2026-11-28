@@ -141,11 +141,11 @@ dataset:
   dataset_name: rajpurkar/squad
   split: train
   # Truncate, never pad. Longer documents need more GPU memory; 256 tokens is the length
-  # this topology has been run with. The answer is at the end of a row, so about 11% of
-  # the training rows lose it to truncation and contribute no loss. 384 tokens keep 99% of
-  # them; an earlier state of this code ran 40 steps at 384 tokens on this topology with the
-  # torch experts and dispatcher, with 2.5% of the device memory left. The full model has not been
-  # trained with longer documents. From
+  # of the 100-update validation run. The answer is at the end of a row, so about 11% of
+  # the training rows lose it to truncation and contribute no loss. With 384 tokens about 1%
+  # do. With seq_length: 384 this recipe ran 100 updates without a checkpoint, with 157.6 of
+  # 184.3 GiB in use on the fullest GPU against 153.2 GiB at 256. The model card has the
+  # numbers and a table of longer documents with ep_size: 8 and ep_size: 16. From
   # position 2,176 of a document on, the DSA layers discard keys; the model card reports what
   # was run at 4,096 tokens.
   seq_length: 256
