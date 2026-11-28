@@ -463,6 +463,16 @@ def _aligned_length(length: int, alignment: int) -> int:
     return ((length + alignment - 1) // alignment) * alignment
 
 
+def _cpu_long_row(value) -> torch.Tensor:
+    """Return a CPU int64 view or copy of a 1-D token row."""
+    if isinstance(value, torch.Tensor):
+        row = value.detach()
+        if row.dtype != torch.long or row.device.type != "cpu":
+            row = row.to(dtype=torch.long, device="cpu")
+        return row
+    return torch.as_tensor(value, dtype=torch.long)
+
+
 def _build_packed_vlm_sample(
     samples: list[dict],
     pack_size: int,
@@ -474,16 +484,22 @@ def _build_packed_vlm_sample(
     if has_mrope and sequence_alignment > 1:
         raise NotImplementedError("Context-parallel THD packing for multi-axis mRoPE VLMs is not yet implemented.")
 
-    all_input_ids: list[int] = []
-    all_labels: list[int] = []
-    all_attention_mask: list[int] = []
-    all_mm_token_type_ids: list[int] = []
+    # Copy token rows into one buffer. A Python list per document, then
+    # torch.tensor, dominated materializing a long pack on the training process.
+    seq_lens = []
+    for sample in samples:
+        ids = sample["input_ids"]
+        seq_lens.append(int(ids.shape[0] if isinstance(ids, torch.Tensor) else len(ids)))
+    seq_lens_padded = [_aligned_length(seq_len, sequence_alignment) for seq_len in seq_lens]
+    total = sum(seq_lens_padded)
+    input_ids = torch.empty(total, dtype=torch.long)
+    labels = torch.empty(total, dtype=torch.long)
+    attention_mask = torch.empty(total, dtype=torch.long)
+    mm_token_type_ids = torch.empty(total, dtype=torch.long)
     has_vision_token_types = any(sample.get("vision_token_types") is not None for sample in samples)
-    all_vision_token_types: list[int] = []
-    all_position_ids_1d: list[int] = []
+    vision_token_types = torch.empty(total, dtype=torch.long) if has_vision_token_types else None
+    position_ids_1d = torch.empty(total, dtype=torch.long)
     mrope_position_ids_list: list[torch.Tensor] = []
-    seq_lens: list[int] = []
-    seq_lens_padded: list[int] = []
 
     pixel_values_list: list[torch.Tensor | list[torch.Tensor]] = []
     patch_pixel_values_list: list[torch.Tensor] = []
@@ -498,39 +514,38 @@ def _build_packed_vlm_sample(
     n_images = 0
     n_videos = 0
 
-    for seq_idx, sample in enumerate(samples, start=1):
-        ids = sample["input_ids"]
-        labs = sample["labels"]
-        if isinstance(ids, torch.Tensor):
-            ids = ids.tolist()
-        if isinstance(labs, torch.Tensor):
-            labs = labs.tolist()
-
-        seq_len = len(ids)
-        padded_seq_len = _aligned_length(seq_len, sequence_alignment)
-        pad = padded_seq_len - seq_len
-        seq_lens.append(seq_len)
-        seq_lens_padded.append(padded_seq_len)
-        all_input_ids.extend(ids + [padding_idx] * pad)
-        all_labels.extend(labs + [-100] * pad)
-        all_attention_mask.extend([seq_idx] * padded_seq_len)
+    offset = 0
+    for seq_idx, (sample, seq_len, padded_seq_len) in enumerate(zip(samples, seq_lens, seq_lens_padded), start=1):
+        end = offset + padded_seq_len
+        real_end = offset + seq_len
+        ids = _cpu_long_row(sample["input_ids"])
+        labs = _cpu_long_row(sample["labels"])
+        input_ids[offset:real_end] = ids
+        labels[offset:real_end] = labs
+        attention_mask[offset:end] = seq_idx
+        if seq_len != padded_seq_len:
+            input_ids[real_end:end] = padding_idx
+            labels[real_end:end] = -100
 
         mm_ttids = sample.get("mm_token_type_ids")
-        if mm_ttids is not None:
-            mm_ttids = mm_ttids.tolist() if isinstance(mm_ttids, torch.Tensor) else list(mm_ttids)
-            all_mm_token_type_ids.extend(mm_ttids + [0] * pad)
+        if mm_ttids is None:
+            mm_token_type_ids[offset:end] = 0
         else:
-            all_mm_token_type_ids.extend([0] * padded_seq_len)
+            mm_token_type_ids[offset:real_end] = _cpu_long_row(mm_ttids)
+            if seq_len != padded_seq_len:
+                mm_token_type_ids[real_end:end] = 0
 
-        if has_vision_token_types:
+        if vision_token_types is not None:
             types = sample.get("vision_token_types")
-            if types is not None:
-                types = torch.as_tensor(types).reshape(-1).tolist()
-                if len(types) != seq_len:
-                    raise ValueError("vision_token_types must align with shifted input_ids")
+            if types is None:
+                vision_token_types[offset:end] = -1
             else:
-                types = [-1] * seq_len
-            all_vision_token_types.extend(types + [-1] * pad)
+                types = torch.as_tensor(types).reshape(-1)
+                if types.numel() != seq_len:
+                    raise ValueError("vision_token_types must align with shifted input_ids")
+                vision_token_types[offset:real_end] = types.detach().to(dtype=torch.long, device="cpu")
+                if seq_len != padded_seq_len:
+                    vision_token_types[real_end:end] = -1
         if sample.get("image_grid_hws") is not None:
             image_grid_hws_list.append(sample["image_grid_hws"])
             n_images += sample["image_grid_hws"].shape[0]
@@ -538,7 +553,7 @@ def _build_packed_vlm_sample(
         if has_mrope and "position_ids" in sample:
             mrope_position_ids_list.append(sample["position_ids"])
         else:
-            all_position_ids_1d.extend(range(padded_seq_len))
+            position_ids_1d[offset:end] = torch.arange(padded_seq_len)
 
         if "pixel_values" in sample and sample["pixel_values"] is not None:
             pixel_values_list.append(sample["pixel_values"])
@@ -562,28 +577,29 @@ def _build_packed_vlm_sample(
             video_grid_thw_list.append(sample["video_grid_thw"])
         if "second_per_grid_ts" in sample and sample["second_per_grid_ts"] is not None:
             second_per_grid_ts_list.append(sample["second_per_grid_ts"])
+        offset = end
 
     # No padding here — collater pads to batch-max for efficiency.
     packed = {
-        "input_ids": torch.tensor(all_input_ids, dtype=torch.long),
-        "labels": torch.tensor(all_labels, dtype=torch.long),
-        "attention_mask": torch.tensor(all_attention_mask, dtype=torch.long),
-        "mm_token_type_ids": torch.tensor(all_mm_token_type_ids, dtype=torch.long),
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": attention_mask,
+        "mm_token_type_ids": mm_token_type_ids,
         "seq_lens": seq_lens,
         "seq_lens_padded": seq_lens_padded,
         "n_images": n_images,
         "n_videos": n_videos,
     }
 
-    if has_vision_token_types:
-        packed["vision_token_types"] = torch.tensor(all_vision_token_types, dtype=torch.long)
+    if vision_token_types is not None:
+        packed["vision_token_types"] = vision_token_types
     if image_grid_hws_list:
         packed["image_grid_hws"] = torch.cat(image_grid_hws_list)
 
     if has_mrope and mrope_position_ids_list:
         packed["position_ids"] = torch.cat(mrope_position_ids_list, dim=1)
     else:
-        packed["position_ids"] = torch.tensor(all_position_ids_1d, dtype=torch.long)
+        packed["position_ids"] = position_ids_1d
 
     if (
         image_sizes_list
