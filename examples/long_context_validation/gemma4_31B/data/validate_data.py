@@ -23,12 +23,14 @@ rather than attention-mask shape:
   1. has_supervised_token       -- at least one label != -100. Catches the
      all-masked failure mode, a live risk for Gemma4 since its chat template has
      no real ``{% generation %}`` block (masking uses the multiturn fallback).
-  2. stop_token_in_supervised   -- the Gemma4 turn terminator ``<turn|>`` (id 106)
-     appears among supervised tokens. ``eos_token_id`` (1 = ``<eos>``) is NOT the
-     learned stop token; generation_config stops on 106.
-  3. final_turn_terminated      -- the terminator (106) is among the last few
-     supervised tokens (assistant turns render as ``<turn|>`` then ``\\n``), so the
-     final assistant turn is complete and was not truncated mid-turn.
+  2. stop_token_in_supervised   -- a Gemma4 stop token appears among supervised
+     tokens: the turn terminator ``<turn|>`` (id 106), or ``<|tool_response>`` (id 50),
+     which the model emits after its tool calls. ``eos_token_id`` (1 = ``<eos>``) is
+     NOT the learned stop token; generation_config stops on 106 and 50.
+  3. final_turn_terminated      -- a stop token is among the last few supervised
+     tokens (``<turn|>`` then ``\\n``, or ``<|tool_response>`` when the trajectory ends
+     on a tool call such as ``finish``), so the final model turn is complete and
+     was not truncated mid-turn.
   4. pad_positions_masked       -- wherever input_ids == pad_token_id, labels are
      -100 (padding never contributes to loss), regardless of padding side.
 
@@ -71,22 +73,29 @@ def parse_args() -> argparse.Namespace:
         "--chat_template",
         type=str,
         default=_DEFAULT_CHAT_TEMPLATE,
-        help="Chat template (Jinja file or string) with {% generation %} blocks for direct assistant "
+        help="Chat template (Jinja file or string) with {%% generation %%} blocks for direct assistant "
         "masking. Empty string uses the tokenizer's own template (the prefix-arithmetic fallback).",
     )
-    parser.add_argument("--stop_token_id", type=int, default=106, help="Gemma4 turn terminator <turn|> (id 106).")
+    parser.add_argument(
+        "--stop_token_id",
+        type=int,
+        nargs="+",
+        default=[106, 50],
+        help="Gemma4 stop tokens a model turn may end on: <turn|> (106) and <|tool_response> (50).",
+    )
     parser.add_argument(
         "--terminator_window",
         type=int,
         default=2,
-        help="Stop token must appear within this many trailing supervised tokens (turns end with <turn|> then newline).",
+        help="Stop token must appear within this many trailing supervised tokens (turns end with <turn|> then newline), "
+        "and the last supervised token within this many tokens of the sequence end.",
     )
     parser.add_argument("--num-samples", type=int, default=0, help="Number of samples to check (0 = all)")
     return parser.parse_args()
 
 
 def validate(
-    dataset, pad_token_id: int, stop_token_id: int, terminator_window: int, num_samples: int
+    dataset, pad_token_id: int, stop_token_ids: List[int], terminator_window: int, num_samples: int
 ) -> Tuple[List[str], Dict[str, int], Dict[str, int], Dict[str, list], int]:
     """Run all assertions over *dataset* and return per-assertion counts."""
     n = len(dataset) if num_samples == 0 else min(num_samples, len(dataset))
@@ -120,15 +129,19 @@ def validate(
 
         record(
             "stop_token_in_supervised",
-            stop_token_id in supervised_ids,
-            f"sample {i}: stop token {stop_token_id} absent from {len(supervised_ids)} supervised tokens",
+            any(t in supervised_ids for t in stop_token_ids),
+            f"sample {i}: stop tokens {stop_token_ids} absent from {len(supervised_ids)} supervised tokens",
         )
 
         tail = supervised_ids[-terminator_window:] if supervised_ids else []
+        # A <|tool_response> follows every tool call, so a row cut inside a (masked) tool result still ends its
+        # supervised labels on a stop token. Also require the supervision to reach the end of the sequence.
+        last_real = max((j for j in range(len(input_ids)) if input_ids[j] != pad_token_id), default=-1)
+        last_supervised = max((j for j in range(len(labels)) if labels[j] != -100), default=-1)
         record(
             "final_turn_terminated",
-            stop_token_id in tail,
-            f"sample {i}: final supervised tokens {tail} lack terminator {stop_token_id} (possible mid-turn truncation)",
+            any(t in tail for t in stop_token_ids) and last_real - last_supervised <= terminator_window,
+            f"sample {i}: final supervised tokens {tail} lack a terminator {stop_token_ids} (possible mid-turn truncation)",
         )
 
         bad_pad = [j for j in range(len(input_ids)) if input_ids[j] == pad_token_id and labels[j] != -100]
@@ -148,12 +161,11 @@ def main() -> None:
     """Run CoderForge ChatDataset validation from the command line."""
     args = parse_args()
 
-    from transformers import AutoTokenizer
-
+    from nemo_automodel import NeMoAutoTokenizer
     from nemo_automodel.components.datasets.llm.chat_dataset import ChatDataset
 
     print(f"Loading tokenizer: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = NeMoAutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
     print(f"Loading dataset: {args.dataset} (seq_length={args.seq_length}, padding={args.padding})")
@@ -167,7 +179,7 @@ def main() -> None:
     )
     print(f"Dataset size: {len(dataset)}")
     print(
-        f"stop_token_id: {args.stop_token_id}  pad_token_id: {pad_token_id}  (tokenizer.eos_token_id={tokenizer.eos_token_id})"
+        f"stop_token_ids: {args.stop_token_id}  pad_token_id: {pad_token_id}  (tokenizer.eos_token_id={tokenizer.eos_token_id})"
     )
     print()
 
