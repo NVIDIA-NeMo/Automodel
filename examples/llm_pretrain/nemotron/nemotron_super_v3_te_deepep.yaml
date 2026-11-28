@@ -42,6 +42,7 @@ model:
     dispatcher_hybridep_permute_fusion: true
     dispatcher_hybridep_compact_routing: true
     dispatcher_recompute_cache: moe_tail
+    shared_expert_overlap: true  # shared experts on a side stream, as before #2486
     fake_balanced_gate: false
     enable_hf_state_dict_adapter: true
 checkpoint:
