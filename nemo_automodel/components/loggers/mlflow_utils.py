@@ -12,19 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import contextlib
 import logging
 import sys
-from typing import Any, Callable, Dict, cast
+import warnings
+from collections.abc import Mapping, Sequence
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import torch
 import torch.distributed as dist
 
+if TYPE_CHECKING:
+    from mlflow.entities import Run
+
 logger = logging.getLogger(__name__)
 
+# A value of a YAML-ready config tree (ConfigNode.to_yaml_dict); only dict values are split further.
+ParamValue: TypeAlias = "str | int | float | bool | None | Sequence[ParamValue] | Mapping[str, ParamValue]"
+# A value of a recipe's metrics record (MetricsSample.to_dict); only numbers and tensors are kept.
+MetricValue: TypeAlias = "torch.Tensor | float | int | str | None | Sequence[float]"
 
-def configure_mlflow(cfg: Any) -> Any | None:
-    """Configure MLflow on rank 0 and start (or resume) a run.
+
+def configure_mlflow(cfg: Any) -> Run | None:
+    """Deprecated: build the run with ``MLflowConfig.build`` instead.
+
+    Recipes get the typed config from ``RecipeConfig.mlflow`` and call
+    ``build(checkpoint_dir=..., run_config=...)`` on it. This shim maps a raw
+    config's ``mlflow:`` block onto ``MLflowConfig`` and will be removed.
+
+    Configure MLflow on rank 0 and start (or resume) a run.
 
     Also installs a `sys.excepthook` so crashed jobs report as FAILED rather
     than FINISHED. After this call the recipe logs via module-level
@@ -35,10 +54,12 @@ def configure_mlflow(cfg: Any) -> Any | None:
     Returns the active run on rank 0, or None when MLflow is not configured
     or on non-rank-0 processes.
     """
-    # Back-compat shim. All MLflow setup logic lives in MLflowConfig.build (the
-    # single implementation); recipes construct MLflowConfig via RecipeConfig.mlflow
-    # and call build() directly. This wrapper maps a raw cfg's `mlflow:` block onto
-    # the typed config so existing callers keep working.
+    warnings.warn(
+        "configure_mlflow is deprecated; use MLflowConfig.build(checkpoint_dir=..., run_config=...) "
+        "(recipes get the config from RecipeConfig.mlflow)",
+        FutureWarning,
+        stacklevel=2,
+    )
     from nemo_automodel.components.loggers.loggers import MLflowConfig
 
     if not (dist.is_initialized() and dist.get_rank() == 0):
@@ -69,11 +90,11 @@ def configure_mlflow(cfg: Any) -> Any | None:
 
 
 def flatten_params_for_mlflow(
-    params: Dict[str, Any],
+    params: Mapping[str, ParamValue],
     max_depth: int | None = 1,
     prefix: str = "",
     _depth: int = 0,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """Flatten nested dicts to dot-keyed strings for MLflow params.
 
     `max_depth` controls how many levels of dict nesting get split into
@@ -88,21 +109,17 @@ def flatten_params_for_mlflow(
     Lists and tuples are always stringified; per-element keys would add
     noise without helping comparison (e.g. `betas: [0.9, 0.95]`).
     """
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     for k, v in params.items():
         full_key = f"{prefix}.{k}" if prefix else k
         if isinstance(v, dict) and (max_depth is None or _depth < max_depth):
-            out.update(
-                flatten_params_for_mlflow(
-                    cast(Dict[str, Any], v), max_depth=max_depth, prefix=full_key, _depth=_depth + 1
-                )
-            )
+            out.update(flatten_params_for_mlflow(v, max_depth=max_depth, prefix=full_key, _depth=_depth + 1))
         else:
             out[full_key] = str(v)
     return out
 
 
-def to_float_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
+def to_float_metrics(metrics: Mapping[str, MetricValue]) -> dict[str, float]:
     """Clean a metrics dict before passing to `mlflow.log_metrics`.
 
     `MetricsSample.to_dict()` mixes numbers, tensors, and a string `timestamp`
@@ -115,7 +132,7 @@ def to_float_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
       `.mean()` first).
     * Python scalars — coerced to float.
     """
-    out: Dict[str, float] = {}
+    out: dict[str, float] = {}
     for k, v in metrics.items():
         if isinstance(v, torch.Tensor):
             out[k] = float(v.item() if v.numel() == 1 else v.mean().item())
@@ -166,13 +183,13 @@ def _install_mlflow_failure_hook() -> None:
     except ImportError:
         return
 
-    prev_excepthook: Callable[..., None] = sys.excepthook
+    prev_excepthook = sys.excepthook
 
     # Idempotent: avoid wrapping our own hook in chains.
     if getattr(prev_excepthook, "_mlflow_failure_hook", False):
         return
 
-    def hook(exc_type: type[BaseException], exc_val: BaseException, exc_tb: Any) -> None:
+    def hook(exc_type: type[BaseException], exc_val: BaseException, exc_tb: TracebackType | None) -> None:
         if mlflow.active_run() is not None:
             with contextlib.suppress(Exception):
                 mlflow.end_run(status="FAILED")

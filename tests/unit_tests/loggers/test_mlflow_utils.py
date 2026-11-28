@@ -144,6 +144,19 @@ class TestConfigureMlflow:
             mlflow.end_run()
         sys.excepthook = original_excepthook
 
+    def _build(self, *, ckpt_dir=None, mlflow_overrides=None, yaml_dict=None):
+        ckpt_dir = ckpt_dir if ckpt_dir is not None else self.tmp_path / "ckpt"
+        config = MLflowConfig(
+            experiment_name="test-exp",
+            tracking_uri=self.tracking_uri,
+            artifact_location=(self.tmp_path / "artifacts").as_uri(),
+            **(mlflow_overrides or {}),
+        )
+        return config.build(
+            checkpoint_dir=str(ckpt_dir),
+            run_config=yaml_dict if yaml_dict is not None else {"foo": "bar"},
+        )
+
     def _make_cfg(self, *, ckpt_dir=None, mlflow_overrides=None, yaml_dict=None):
         ckpt_dir = ckpt_dir if ckpt_dir is not None else self.tmp_path / "ckpt"
         return _Cfg(
@@ -159,49 +172,65 @@ class TestConfigureMlflow:
 
     def test_returns_none_when_not_rank_zero(self, monkeypatch):
         monkeypatch.setattr(dist, "get_rank", lambda: 1, raising=False)
-        assert configure_mlflow(self._make_cfg()) is None
+        assert self._build() is None
         assert mlflow.active_run() is None
 
-    def test_returns_none_when_no_mlflow_config(self):
+    def test_configure_mlflow_is_deprecated_and_delegates_to_build(self):
+        with pytest.warns(FutureWarning, match="MLflowConfig.build"):
+            run = configure_mlflow(self._make_cfg(mlflow_overrides={"tags": {"task": "finetune"}}))
+        assert mlflow.get_run(run.info.run_id).data.tags["task"] == "finetune"
+
+    def test_configure_mlflow_warns_and_returns_none_when_no_mlflow_config(self):
         cfg = _Cfg(mlflow=None, checkpoint_dir=str(self.tmp_path / "ckpt"))
-        assert configure_mlflow(cfg) is None
+        with pytest.warns(FutureWarning, match="MLflowConfig.build"):
+            assert configure_mlflow(cfg) is None
         assert mlflow.active_run() is None
+
+    def test_configure_mlflow_warns_and_returns_none_when_not_rank_zero(self, monkeypatch):
+        monkeypatch.setattr(dist, "get_rank", lambda: 1, raising=False)
+        with pytest.warns(FutureWarning, match="MLflowConfig.build"):
+            assert configure_mlflow(self._make_cfg()) is None
+        assert mlflow.active_run() is None
+
+    def test_configure_mlflow_warning_points_at_caller(self):
+        with pytest.warns(FutureWarning) as record:
+            configure_mlflow(self._make_cfg())
+        assert record[0].filename == __file__
 
     def test_starts_run_with_config_tags(self):
-        run = configure_mlflow(self._make_cfg(mlflow_overrides={"tags": {"task": "finetune"}}))
+        run = self._build(mlflow_overrides={"tags": {"task": "finetune"}})
         assert run is not None
         stored = mlflow.get_run(run.info.run_id)
         assert stored.data.tags["task"] == "finetune"
 
     def test_description_maps_to_note_content_tag(self):
-        run = configure_mlflow(self._make_cfg(mlflow_overrides={"description": "Quick smoke run"}))
+        run = self._build(mlflow_overrides={"description": "Quick smoke run"})
         stored = mlflow.get_run(run.info.run_id)
         assert stored.data.tags["mlflow.note.content"] == "Quick smoke run"
 
     def test_logs_config_as_flattened_params(self):
-        cfg = self._make_cfg(yaml_dict={"lr": 1e-3, "model": {"hidden": 64, "layers": 2}})
-        run = configure_mlflow(cfg)
+        run = self._build(yaml_dict={"lr": 1e-3, "model": {"hidden": 64, "layers": 2}})
         params = mlflow.get_run(run.info.run_id).data.params
         assert params["lr"] == "0.001"
         assert params["model.hidden"] == "64"
         assert params["model.layers"] == "2"
 
     def test_logs_config_yaml_artifact(self):
-        run = configure_mlflow(self._make_cfg())
+        run = self._build()
         artifacts = [a.path for a in mlflow.MlflowClient().list_artifacts(run.info.run_id)]
         assert "config.yaml" in artifacts
 
     def test_writes_run_id_sidecar_for_resumption(self):
         ckpt_dir = self.tmp_path / "ckpt"
-        run = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir))
+        run = self._build(ckpt_dir=ckpt_dir)
         assert (ckpt_dir / "mlflow_run_id").read_text() == run.info.run_id
 
     def test_resumes_from_sidecar_when_called_again(self):
         ckpt_dir = self.tmp_path / "ckpt"
-        run1 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir))
+        run1 = self._build(ckpt_dir=ckpt_dir)
         mlflow.end_run()  # simulate process restart
 
-        run2 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir))
+        run2 = self._build(ckpt_dir=ckpt_dir)
         assert run2.info.run_id == run1.info.run_id
         # And mlflow only sees one run, not two
         runs = mlflow.search_runs(experiment_names=["test-exp"], output_format="list")
@@ -209,47 +238,47 @@ class TestConfigureMlflow:
 
     def test_resumes_from_env_var(self, monkeypatch):
         # First call creates a run we'll resume into
-        run1 = configure_mlflow(self._make_cfg(ckpt_dir=self.tmp_path / "ckpt-A"))
+        run1 = self._build(ckpt_dir=self.tmp_path / "ckpt-A")
         mlflow.end_run()
 
         # Second call uses a *different* checkpoint dir (no sidecar match) but
         # MLFLOW_RUN_ID points at run1 — should resume run1
         monkeypatch.setenv("MLFLOW_RUN_ID", run1.info.run_id)
-        run2 = configure_mlflow(self._make_cfg(ckpt_dir=self.tmp_path / "ckpt-B"))
+        run2 = self._build(ckpt_dir=self.tmp_path / "ckpt-B")
         assert run2.info.run_id == run1.info.run_id
 
     def test_env_var_takes_precedence_over_sidecar(self, monkeypatch):
         # Two separate runs created via two separate ckpt_dirs
-        run_a = configure_mlflow(self._make_cfg(ckpt_dir=self.tmp_path / "ckpt-A"))
+        run_a = self._build(ckpt_dir=self.tmp_path / "ckpt-A")
         mlflow.end_run()
-        run_b = configure_mlflow(self._make_cfg(ckpt_dir=self.tmp_path / "ckpt-B"))
+        run_b = self._build(ckpt_dir=self.tmp_path / "ckpt-B")
         mlflow.end_run()
         assert run_a.info.run_id != run_b.info.run_id
 
         # ckpt-A's sidecar points at run_a; env var points at run_b → env wins
         monkeypatch.setenv("MLFLOW_RUN_ID", run_b.info.run_id)
-        resumed = configure_mlflow(self._make_cfg(ckpt_dir=self.tmp_path / "ckpt-A"))
+        resumed = self._build(ckpt_dir=self.tmp_path / "ckpt-A")
         assert resumed.info.run_id == run_b.info.run_id
 
     def test_resumed_run_skips_param_logging(self):
         ckpt_dir = self.tmp_path / "ckpt"
         # Initial launch logs params
-        run1 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir, yaml_dict={"lr": 1e-3}))
+        run1 = self._build(ckpt_dir=ckpt_dir, yaml_dict={"lr": 1e-3})
         original_params = dict(mlflow.get_run(run1.info.run_id).data.params)
         mlflow.end_run()
 
         # Resume with different yaml — params shouldn't change (would raise if re-logged
         # with a different value; we don't even attempt the re-log on resume)
-        configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir, yaml_dict={"lr": 5e-4}))
+        self._build(ckpt_dir=ckpt_dir, yaml_dict={"lr": 5e-4})
         resumed_params = dict(mlflow.get_run(run1.info.run_id).data.params)
         assert resumed_params == original_params
 
     def test_resumed_run_writes_timestamped_artifact(self):
         ckpt_dir = self.tmp_path / "ckpt"
-        run1 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir))
+        run1 = self._build(ckpt_dir=ckpt_dir)
         mlflow.end_run()
 
-        configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir))
+        self._build(ckpt_dir=ckpt_dir)
         artifacts = {a.path for a in mlflow.MlflowClient().list_artifacts(run1.info.run_id)}
         # Initial config.yaml plus a timestamped resume snapshot
         assert "config.yaml" in artifacts
@@ -258,51 +287,51 @@ class TestConfigureMlflow:
     def test_resume_false_ignores_existing_sidecar(self):
         ckpt_dir = self.tmp_path / "ckpt"
         # First run seeds the sidecar
-        run1 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir))
+        run1 = self._build(ckpt_dir=ckpt_dir)
         mlflow.end_run()
         assert (ckpt_dir / "mlflow_run_id").read_text() == run1.info.run_id
 
         # Second launch with resume disabled — must start a new run
-        run2 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir, mlflow_overrides={"resume": False}))
+        run2 = self._build(ckpt_dir=ckpt_dir, mlflow_overrides={"resume": False})
         assert run2.info.run_id != run1.info.run_id
 
     def test_resume_false_still_honors_env_var(self, monkeypatch):
         """`resume: false` gates the implicit sidecar lookup only — an
         explicit `MLFLOW_RUN_ID` env var is treated as a deliberate user
         override and still resumes the named run."""
-        run1 = configure_mlflow(self._make_cfg(ckpt_dir=self.tmp_path / "ckpt-A"))
+        run1 = self._build(ckpt_dir=self.tmp_path / "ckpt-A")
         mlflow.end_run()
 
         monkeypatch.setenv("MLFLOW_RUN_ID", run1.info.run_id)
-        run2 = configure_mlflow(self._make_cfg(ckpt_dir=self.tmp_path / "ckpt-B", mlflow_overrides={"resume": False}))
+        run2 = self._build(ckpt_dir=self.tmp_path / "ckpt-B", mlflow_overrides={"resume": False})
         assert run2.info.run_id == run1.info.run_id
 
     def test_resume_false_still_writes_sidecar(self):
         """A future `resume: true` launch (or recovery) must still be able to
         find the run, so the sidecar is always written even when resume is off."""
         ckpt_dir = self.tmp_path / "ckpt"
-        run = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir, mlflow_overrides={"resume": False}))
+        run = self._build(ckpt_dir=ckpt_dir, mlflow_overrides={"resume": False})
         assert (ckpt_dir / "mlflow_run_id").read_text() == run.info.run_id
 
     def test_resume_false_overwrites_existing_sidecar(self):
         """Sidecar always points to the most recent run for this checkpoint_dir,
         so a `resume: false` launch overwrites any prior sidecar."""
         ckpt_dir = self.tmp_path / "ckpt"
-        run1 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir))
+        run1 = self._build(ckpt_dir=ckpt_dir)
         mlflow.end_run()
 
-        run2 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir, mlflow_overrides={"resume": False}))
+        run2 = self._build(ckpt_dir=ckpt_dir, mlflow_overrides={"resume": False})
         assert run2.info.run_id != run1.info.run_id
         assert (ckpt_dir / "mlflow_run_id").read_text() == run2.info.run_id
 
     def test_resume_default_is_true(self):
         """Omitting `resume` keeps the existing auto-resume behaviour."""
         ckpt_dir = self.tmp_path / "ckpt"
-        run1 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir))
+        run1 = self._build(ckpt_dir=ckpt_dir)
         mlflow.end_run()
 
         # No `resume` key — should resume run1
-        run2 = configure_mlflow(self._make_cfg(ckpt_dir=ckpt_dir))
+        run2 = self._build(ckpt_dir=ckpt_dir)
         assert run2.info.run_id == run1.info.run_id
 
 
