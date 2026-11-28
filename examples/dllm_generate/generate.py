@@ -107,15 +107,29 @@ import math
 from dataclasses import dataclass, replace
 
 import torch
-from utils import (
-    GEMMA_ADAPTER_KEY_MAP,
-    get_num_transfer_tokens,
-    get_transfer_index,
-    load_model_and_tokenizer,
-    merge_adapter,
-    resolve_checkpoint,
-    trim_response,
-)
+
+# Module execution uses the installed package; direct script execution keeps
+# resolving the sibling file from the script directory.
+if __package__:
+    from .utils import (
+        GEMMA_ADAPTER_KEY_MAP,
+        get_num_transfer_tokens,
+        get_transfer_index,
+        load_model_and_tokenizer,
+        merge_adapter,
+        resolve_checkpoint,
+        trim_response,
+    )
+else:
+    from utils import (
+        GEMMA_ADAPTER_KEY_MAP,
+        get_num_transfer_tokens,
+        get_transfer_index,
+        load_model_and_tokenizer,
+        merge_adapter,
+        resolve_checkpoint,
+        trim_response,
+    )
 
 from nemo_automodel.components.loss.dllm_loss import scdd_schedule
 

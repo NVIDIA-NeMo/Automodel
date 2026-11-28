@@ -22,13 +22,13 @@ Supports:
 
 Usage:
     # Image preprocessing
-    python -m tools.diffusion.preprocessing_multiprocess image \\
+    python -m nemo_automodel.tools.diffusion.preprocessing_multiprocess image \\
         --image_dir /path/to/images \\
         --output_dir /path/to/cache \\
         --processor flux
 
     # Image preprocessing from a Hugging Face dataset
-    python -m tools.diffusion.preprocessing_multiprocess image \\
+    python -m nemo_automodel.tools.diffusion.preprocessing_multiprocess image \\
         --dataset_name lambdalabs/naruto-blip-captions \\
         --dataset_media_column image \\
         --dataset_caption_column text \\
@@ -36,14 +36,14 @@ Usage:
         --processor flux
 
     # Video preprocessing
-    python -m tools.diffusion.preprocessing_multiprocess video \\
+    python -m nemo_automodel.tools.diffusion.preprocessing_multiprocess video \\
         --video_dir /path/to/videos \\
         --output_dir /path/to/cache \\
         --processor wan \\
         --resolution_preset 512p
 
     # List available processors
-    python -m tools.diffusion.preprocessing_multiprocess --list_processors
+    python -m nemo_automodel.tools.diffusion.preprocessing_multiprocess --list_processors
 """
 
 import argparse
@@ -65,8 +65,9 @@ from PIL import Image
 from tqdm import tqdm
 
 from nemo_automodel.components.datasets.diffusion.multi_tier_bucketing import MultiTierBucketCalculator
-from tools.diffusion.data.hf_dataset_export import HFDatasetMediaMapping, materialize_hf_dataset
-from tools.diffusion.processors import (
+
+from .data.hf_dataset_export import HFDatasetMediaMapping, materialize_hf_dataset
+from .processors import (
     BaseModelProcessor,
     BaseVideoProcessor,
     ProcessorRegistry,
@@ -179,7 +180,7 @@ def _load_all_captions(
     image_files: List[Path], caption_field: str = "internvl", verbose: bool = True
 ) -> Dict[str, str]:
     """Pre-load all captions from JSONL files. Returns filename->caption dict."""
-    from tools.diffusion.processors.caption_loaders import JSONLCaptionLoader
+    from .processors.caption_loaders import JSONLCaptionLoader
 
     loader = JSONLCaptionLoader(jsonl_suffix="_internvl.json")
     captions, stats = loader.load_captions_with_stats(image_files, caption_field, verbose=verbose)
@@ -1224,17 +1225,17 @@ def main() -> None:
         epilog="""
 Examples:
   # Image preprocessing with FLUX
-  python -m tools.diffusion.preprocessing_multiprocess image \\
+  python -m nemo_automodel.tools.diffusion.preprocessing_multiprocess image \\
       --image_dir /data/images --output_dir /cache --processor flux
 
   # Image preprocessing from a Hugging Face dataset
-  python -m tools.diffusion.preprocessing_multiprocess image \\
+  python -m nemo_automodel.tools.diffusion.preprocessing_multiprocess image \\
       --dataset_name lambdalabs/naruto-blip-captions \\
       --dataset_media_column image --dataset_caption_column text \\
       --output_dir /cache --processor flux
 
   # Image-edit preprocessing from a Hugging Face dataset
-  python -m tools.diffusion.preprocessing_multiprocess image-edit \\
+  python -m nemo_automodel.tools.diffusion.preprocessing_multiprocess image-edit \\
       --dataset_name org/image-edit-dataset \\
       --dataset_media_mapping target=target_image \\
       --dataset_media_mapping context=source_image \\
@@ -1243,12 +1244,12 @@ Examples:
       --output_dir /cache
 
   # Video preprocessing with Wan2.1
-  python -m tools.diffusion.preprocessing_multiprocess video \\
+  python -m nemo_automodel.tools.diffusion.preprocessing_multiprocess video \\
       --video_dir /data/videos --output_dir /cache --processor wan \\
       --resolution_preset 512p --caption_format sidecar
 
   # Video preprocessing with HunyuanVideo
-  python -m tools.diffusion.preprocessing_multiprocess video \\
+  python -m nemo_automodel.tools.diffusion.preprocessing_multiprocess video \\
       --video_dir /data/videos --output_dir /cache --processor hunyuan \\
       --target_frames 121 --caption_format meta_json
         """,
