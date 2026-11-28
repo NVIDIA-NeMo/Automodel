@@ -21,13 +21,36 @@ so they feed the processor's ``audio=`` kwarg directly without going through
 marker-based :func:`nemo_automodel.components.datasets.vlm.collate_fns.build_labels_from_template`.
 """
 
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, TypedDict, Optional
 
 import numpy as np
 import torch
 
 from nemo_automodel.components.datasets.vlm.collate_fns import build_labels_from_template
 
+# ---------------------------------------------------------------------------
+# Sound type definitions
+# ---------------------------------------------------------------------------
+class SoundSample(TypedDict):
+    """TypedDict representing a single audio sample.
+
+    Attributes
+    ----------
+    audio : torch.Tensor
+        1-D waveform tensor of shape ``(num_samples,)``.
+    sample_rate : int
+        Sampling rate of the waveform.
+    metadata : Optional[Dict[str, Any]]
+        Optional dictionary containing arbitrary metadata.
+    """
+
+    audio: torch.Tensor
+    sample_rate: int
+    metadata: Optional[Dict[str, Any]]
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
 def _extract_audios_from_conversation(conversation: Sequence[Dict[str, Any]]) -> List[Any]:
     """Walk a Qwen-Omni-style conversation and collect audio payloads in order.
@@ -114,6 +137,9 @@ def _conversation_ends_with_assistant_text(conversation: Sequence[Dict[str, Any]
                     return True
     return False
 
+# ---------------------------------------------------------------------------
+# Public collate functions
+# ---------------------------------------------------------------------------
 
 def qwen3_omni_asr_collate_fn(
     examples: Sequence[Dict[str, Any]],
